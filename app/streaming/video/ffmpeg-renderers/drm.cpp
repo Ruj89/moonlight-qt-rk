@@ -4,6 +4,7 @@
 #endif
 
 #include "drm.h"
+#include "drmprimeframe.h"
 #include "utils.h"
 
 extern "C" {
@@ -243,6 +244,14 @@ DrmRenderer::~DrmRenderer()
 
 bool DrmRenderer::prepareDecoderContext(AVCodecContext* context, AVDictionary** options)
 {
+    if (m_SupportsDirectRendering && QString::fromUtf8(context->codec->name).endsWith("_rkmpp")) {
+        // Use linear NV12/NV15 buffers for KMS scanout. AFBC uses different
+        // fourccs and layouts that are not supported by our plane selection.
+        // The normal per-decoder AVOPTIONS override is applied after this.
+        av_dict_set_int(options, "afbc", 0, 0);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Requesting linear RKMPP DMA-BUFs for DRM scanout");
+    }
+
     // The out-of-tree LibreELEC patches use this option to control the type of the V4L2
     // buffers that we get back. We only support NV12 buffers now.
     if(strstr(context->codec->name, "_v4l2") != NULL)
@@ -291,15 +300,18 @@ void DrmRenderer::prepareToRender()
     // time we swap buffers. We have to do this before we enumerate
     // CRTC modes below.
     SDL_Renderer* renderer = SDL_CreateRenderer(m_Window, -1, SDL_RENDERER_SOFTWARE);
-    if (renderer != nullptr) {
-        // SDL_CreateRenderer() can end up having to recreate our window (SDL_RecreateWindow())
-        // to ensure it's compatible with the renderer's OpenGL context. If that happens, we
-        // can get spurious SDL_WINDOWEVENT events that will cause us to (again) recreate our
-        // renderer. This can lead to an infinite to renderer recreation, so discard all
-        // SDL_WINDOWEVENT events after SDL_CreateRenderer().
-        SDL_assert(Session::get());
-        Session::get()->flushWindowEvents();
 
+    // SDL_CreateRenderer() can end up having to recreate our window (SDL_RecreateWindow())
+    // to ensure it's compatible with the renderer's OpenGL context. If that happens, we
+    // can get spurious SDL_WINDOWEVENT events that will cause us to (again) recreate our
+    // renderer. This can lead to an infinite to renderer recreation, so discard all
+    // SDL_WINDOWEVENT events after SDL_CreateRenderer(). This must happen even if it
+    // failed (e.g. no usable GLES driver on KMSDRM), since the pending window events
+    // are still delivered and would otherwise recreate us in a loop.
+    SDL_assert(Session::get());
+    Session::get()->flushWindowEvents();
+
+    if (renderer != nullptr) {
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
         SDL_RenderClear(renderer);
         SDL_RenderPresent(renderer);
@@ -1595,7 +1607,7 @@ void DrmRenderer::notifyOverlayUpdated(Overlay::OverlayType type)
 
 bool DrmRenderer::addFbForFrame(AVFrame *frame, uint32_t* newFbId, bool testMode)
 {
-    AVDRMFrameDescriptor mappedFrame;
+    AVDRMFrameDescriptor mappedFrame = {};
     AVDRMFrameDescriptor* drmFrame;
     int err;
 
@@ -1621,11 +1633,21 @@ bool DrmRenderer::addFbForFrame(AVFrame *frame, uint32_t* newFbId, bool testMode
         drmFrame = (AVDRMFrameDescriptor*)frame->data[0];
     }
 
+    // Validate before indexing the descriptor or importing any DMA-BUFs.
+    if (!drmFrame || !isDrmPrimeFrameSupported(*drmFrame, m_DrmSupportsModifiers)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Unsupported DRM PRIME descriptor or modifier for KMS scanout");
+        return false;
+    }
+
+    const auto &layer = drmFrame->layers[0];
+    const uint64_t frameModifier = drmFrame->objects[layer.planes[0].object_index].format_modifier;
+
     // If we're testing, check the IN_FORMATS property or legacy plane formats
     if (testMode) {
         bool formatMatch = false;
 
-        uint64_t maskedModifier = drmFrame->objects[0].format_modifier;
+        uint64_t maskedModifier = frameModifier;
         if (fourcc_mod_is_vendor(maskedModifier, BROADCOM)) {
             // Broadcom has modifiers that contain variable data, so we need to mask
             // off the variable data because the IN_FORMATS blob contains the just
@@ -1644,7 +1666,8 @@ bool DrmRenderer::addFbForFrame(AVFrame *frame, uint32_t* newFbId, bool testMode
                 for (uint32_t i = 0; i < header->count_modifiers; i++) {
                     if (modifiers[i].modifier == maskedModifier) {
                         for (uint32_t j = 0; j < header->count_formats && j < sizeof(modifiers[i].formats) * 8; j++) {
-                            if (modifiers[i].formats & (1ULL << j)) {
+                            if (uint64_t(modifiers[i].offset) + j < header->count_formats &&
+                                    (modifiers[i].formats & (1ULL << j))) {
                                 if (formats[modifiers[i].offset + j] == drmFrame->layers[0].format) {
                                     formatMatch = true;
                                     break;
@@ -1696,13 +1719,13 @@ bool DrmRenderer::addFbForFrame(AVFrame *frame, uint32_t* newFbId, bool testMode
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Selected DRM plane supports chosen decoding format and modifier: " FOURCC_FMT " %016" PRIx64,
                         FOURCC_FMT_ARGS(drmFrame->layers[0].format),
-                        drmFrame->objects[0].format_modifier);
+                        frameModifier);
         }
         else {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                          "Selected DRM plane doesn't support chosen decoding format and modifier: " FOURCC_FMT " %016" PRIx64,
                          FOURCC_FMT_ARGS(drmFrame->layers[0].format),
-                         drmFrame->objects[0].format_modifier);
+                         frameModifier);
             return false;
         }
     }
@@ -1713,10 +1736,6 @@ bool DrmRenderer::addFbForFrame(AVFrame *frame, uint32_t* newFbId, bool testMode
     uint64_t modifiers[4] = {};
     uint32_t flags = 0;
 
-    // DRM requires composed layers rather than separate layers per plane
-    SDL_assert(drmFrame->nb_layers == 1);
-
-    const auto &layer = drmFrame->layers[0];
     for (int i = 0; i < layer.nb_planes; i++) {
         const auto &object = drmFrame->objects[layer.planes[i].object_index];
 

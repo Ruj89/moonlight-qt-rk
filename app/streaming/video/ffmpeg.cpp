@@ -77,6 +77,13 @@ static inline uint64_t getReceiveTimeUs(const DECODE_UNIT& du) {
 
 #define FAILED_DECODES_RESET_THRESHOLD 20
 
+static bool isRkmppOnKmsDrm(const AVCodec* decoder)
+{
+    const char* videoDriver = SDL_GetCurrentVideoDriver();
+    return videoDriver && SDL_strcasecmp(videoDriver, "KMSDRM") == 0 &&
+            QString::fromUtf8(decoder->name).endsWith("_rkmpp");
+}
+
 bool FFmpegVideoDecoder::isHardwareAccelerated()
 {
     return m_HwDecodeCfg != nullptr ||
@@ -719,9 +726,12 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
         }
         else if (err == AVERROR_BUG) {
             // RKMPP (Rockchip) decoder can output "invalid frame" on the synthetic test
-            // frame; real stream often works. Accept the decoder so HW accel is still used.
+            // frame; real stream often works. Retain the desktop workaround, but
+            // require a real test frame on KMSDRM to validate DMA-BUF scanout/import.
             const char* codec_name = m_VideoDecoderCtx->codec ? m_VideoDecoderCtx->codec->name : nullptr;
-            if (codec_name && strstr(codec_name, "rkmpp")) {
+            if (codec_name && strstr(codec_name, "rkmpp") &&
+                    !isRkmppOnKmsDrm(decoder) &&
+                    m_FrontendRenderer->getRendererType() != IFFmpegRenderer::RendererType::DRM) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "RKMPP test frame returned AVERROR_BUG; accepting decoder for real stream");
             }
@@ -1222,7 +1232,11 @@ bool FFmpegVideoDecoder::tryInitializeRenderer(const AVCodec* decoder,
     // i == 1 - Direct rendering or indirect via SDL read-back
     bool backendInitFailure = false;
 #ifdef HAVE_EGL
-    for (int i = 0; i < 2 && !backendInitFailure; i++) {
+    // On KMSDRM, scan out RKMPP's DMA-BUFs directly before trying EGL.
+    // Desktop backends retain their existing EGL-first ordering.
+    const bool preferDirectRendering = isRkmppOnKmsDrm(decoder);
+    for (int attempt = 0; attempt < 2 && !backendInitFailure; attempt++) {
+        const int i = preferDirectRendering ? 1 - attempt : attempt;
 #else
     for (int i = 1; i < 2 && !backendInitFailure; i++) {
 #endif
@@ -1235,6 +1249,14 @@ bool FFmpegVideoDecoder::tryInitializeRenderer(const AVCodec* decoder,
 
         // Initialize the backend renderer for testing
         if (initializeRendererInternal(m_BackendRenderer, &testFrameDecoderParams)) {
+#ifdef HAVE_EGL
+            if (preferDirectRendering && i == 1 && !m_BackendRenderer->isDirectRenderingSupported()) {
+                // Do not let the direct-first attempt select SDL copyback ahead
+                // of the zero-copy EGL fallback when no KMS plane is available.
+                reset();
+                continue;
+            }
+#endif
             if (completeInitialization(decoder, requiredFormat, &testFrameDecoderParams,
                                        (m_TestOnly || separateTestDecoder) ? TestMode::TestFrameOnly : TestMode::TestFrame,
                                         i == 0 /* EGL/DRM */)) {
@@ -1391,6 +1413,16 @@ bool FFmpegVideoDecoder::tryInitializeRendererForUnknownDecoder(const AVCodec* d
             }
         }
     }
+
+#ifdef HAVE_DRM
+    if (isRkmppOnKmsDrm(decoder)) {
+        // RKMPP can allocate its own hardware context. Some FFmpeg Rockchip
+        // versions do not advertise a pixel-format list, so explicitly request
+        // DRM PRIME rather than falling through to SDL or software-frame upload.
+        return tryInitializeRenderer(decoder, AV_PIX_FMT_DRM_PRIME, params, nullptr, nullptr,
+                                     []() -> IFFmpegRenderer* { return new DrmRenderer(); });
+    }
+#endif
 
     if (decoder_pix_fmts == NULL) {
         // Supported output pixel formats are unknown. We'll just try DRM/SDL and hope it can cope.
@@ -1734,6 +1766,33 @@ bool FFmpegVideoDecoder::initialize(PDECODER_PARAMETERS params)
     // Look for a hardware decoder first unless software-only
     if (params->vds != StreamingPreferences::VDS_FORCE_SOFTWARE) {
         QSet<const AVCodec*> terminallyFailedHardwareDecoders;
+
+#ifdef HAVE_DRM
+        // Vendor Rockchip kernels expose MPP rather than V4L2 request decoding.
+        // Keep explicit decoder hints above and software-only mode authoritative.
+        const char* videoDriver = SDL_GetCurrentVideoDriver();
+        if (videoDriver && SDL_strcasecmp(videoDriver, "KMSDRM") == 0) {
+            const char* rkmppName = (params->videoFormat & VIDEO_FORMAT_MASK_H264) ? "h264_rkmpp" :
+                                   (params->videoFormat & VIDEO_FORMAT_MASK_H265) ? "hevc_rkmpp" : nullptr;
+            const AVCodec* rkmpp = rkmppName ? avcodec_find_decoder_by_name(rkmppName) : nullptr;
+            if (rkmpp) {
+                if (tryInitializeRendererForUnknownDecoder(rkmpp, params, true)) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Using RKMPP decoder on KMSDRM: %s", rkmppName);
+                    return true;
+                }
+                terminallyFailedHardwareDecoders.insert(rkmpp);
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "RKMPP decoder %s failed on KMSDRM; trying remaining decoders", rkmppName);
+            }
+            else if (rkmppName) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "RKMPP decoder %s is not present in the loaded libavcodec. "
+                            "Rockchip hardware decoding requires FFmpeg built with --enable-rkmpp "
+                            "and the matching runtime libraries; trying remaining decoders",
+                            rkmppName);
+            }
+        }
+#endif
 
         // Try tier 1 hwaccel decoders first
         if (tryInitializeHwAccelDecoder(params, 0, terminallyFailedHardwareDecoders)) {
@@ -2183,4 +2242,3 @@ void FFmpegVideoDecoder::renderFrameOnMainThread()
 {
     m_Pacer->renderOnMainThread();
 }
-

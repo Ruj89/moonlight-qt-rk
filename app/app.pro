@@ -326,7 +326,8 @@ libdrm {
 
     DEFINES += HAVE_DRM
     SOURCES += streaming/video/ffmpeg-renderers/drm.cpp
-    HEADERS += streaming/video/ffmpeg-renderers/drm.h
+    HEADERS += streaming/video/ffmpeg-renderers/drm.h \
+        streaming/video/ffmpeg-renderers/drmprimeframe.h
 
     linux {
         !disable-masterhooks {

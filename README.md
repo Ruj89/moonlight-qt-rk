@@ -2,7 +2,9 @@
 
 All this fork does is to enable hardware decoder support for Rockchip chips running Mali graphics when using vendor / mali blobs instead of MESA / Panthor.
 
-This is tested on Armbian 25.8.1 using vendor kernel 6.1.115 and specifically Gnome 46 using the blob g24p0-wayland-gbm. Both the blob and this fork work only on wayland.
+The original configuration was tested on Armbian 25.8.1 using vendor kernel 6.1.115 and specifically Gnome 46 using the blob g24p0-wayland-gbm, under Wayland.
+
+An experimental compositor-free RKMPP path is also available using Qt EGLFS and SDL KMSDRM. This path has not yet been validated on an Orange Pi.
 
 The chip I tested this with is a RK3588 + Mali G610 (Orange pi 5 plus)
 
