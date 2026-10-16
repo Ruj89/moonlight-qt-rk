@@ -6,6 +6,10 @@ The original configuration was tested on Armbian 25.8.1 using vendor kernel 6.1.
 
 An experimental compositor-free RKMPP path is also available using Qt EGLFS and SDL KMSDRM. This path has not yet been validated on an Orange Pi.
 
+GitHub Actions builds a dedicated **Rockchip ARM64 bundle** with private MPP and
+FFmpeg Rockchip libraries for Orange Pi 5 Plus / Debian Trixie. See the
+[build, installation, and target verification instructions](scripts/rockchip/README.md).
+
 The chip I tested this with is a RK3588 + Mali G610 (Orange pi 5 plus)
 
 Detailed guide at the [wiki](https://github.com/m33ts4k0z/moonlight-qt-rk/wiki/Full-guide-on-how-to-install-this-fork).

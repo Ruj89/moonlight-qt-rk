@@ -38,6 +38,12 @@ jobs:
     with:
       ci_version: ${{ needs.setup.outputs.ci_version }}
 
+  build-rockchip:
+    needs: setup
+    uses: ./.github/workflows/build-rockchip.yml
+    with:
+      ci_version: ${{ needs.setup.outputs.ci_version }}
+
   build-windows-macos:
     needs: setup
     uses: ./.github/workflows/build-win-mac.yml

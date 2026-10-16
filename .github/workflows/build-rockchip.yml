@@ -1,0 +1,68 @@
+---
+name: Build - Rockchip ARM64
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      ci_version:
+        required: true
+        type: string
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CI_VERSION: ${{ inputs.ci_version || github.sha }}
+      BUILD_JOBS: '2'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      # The container runs on amd64 and cross-compiles all private libraries.
+      # No ARM runner, QEMU, registry credentials, or Rockchip devices needed.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build Rockchip dependency image
+        uses: docker/build-push-action@v7
+        with:
+          context: scripts/rockchip
+          file: scripts/rockchip/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: moonlight-rk-arm64-build:ci
+          build-args: BUILD_JOBS=${{ env.BUILD_JOBS }}
+          cache-from: type=gha,scope=rockchip-arm64
+          cache-to: type=gha,scope=rockchip-arm64,mode=max,ignore-error=true
+
+      - name: Build and package Moonlight
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/build/rockchip"
+          docker run --rm --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            -e BUILD_JOBS \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            -v "$GITHUB_WORKSPACE/build/rockchip:/build" \
+            moonlight-rk-arm64-build:ci
+          cd build/rockchip
+          archive="Moonlight-Rockchip-${CI_VERSION}-arm64.tar.gz"
+          mv moonlight-rk-arm64.tar.gz "$archive"
+          sha256sum "$archive" > "$archive.sha256"
+
+      - name: Upload Binaries
+        uses: actions/upload-artifact@v6
+        with:
+          name: Moonlight-Rockchip-ARM64-${{ env.CI_VERSION }}
+          path: |
+            build/rockchip/Moonlight-Rockchip-*-arm64.tar.gz
+            build/rockchip/Moonlight-Rockchip-*-arm64.tar.gz.sha256
+          compression-level: 0
+          if-no-files-found: error

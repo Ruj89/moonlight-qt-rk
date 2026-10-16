@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!build-deps.sh
+!build.sh
+!launch.sh
+!check-rkmpp.c
