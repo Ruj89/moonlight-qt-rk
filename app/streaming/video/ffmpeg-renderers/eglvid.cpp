@@ -769,7 +769,7 @@ bool EGLRenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
-    if (!m_Backend->initializeEGL(m_EGLDisplay, eglExtensions))
+    if (!m_Backend->initializeEGL(this, m_EGLDisplay, eglExtensions))
         return false;
 
     if (!(m_glEGLImageTargetTexture2DOES = (typeof(m_glEGLImageTargetTexture2DOES))eglGetProcAddress("glEGLImageTargetTexture2DOES"))) {
@@ -1072,7 +1072,7 @@ void EGLRenderer::renderFrame(AVFrame* frame)
             // XWayland. Other strategies like calling glGetError() don't seem
             // to be able to detect this situation for some reason.
             SDL_Event event;
-            event.type = SDL_RENDER_TARGETS_RESET;
+            event.type = SDL_RENDER_DEVICE_RESET;
             SDL_PushEvent(&event);
 
             return;
@@ -1098,11 +1098,9 @@ void EGLRenderer::renderFrame(AVFrame* frame)
     // Mali blob workaround: Get GL function pointers via SDL_GL_GetProcAddress
     typedef void (*PFNGLACTIVETEXTUREPROC)(GLenum texture);
     typedef void (*PFNGLBINDTEXTUREPROC)(GLenum target, GLuint texture);
-    typedef void (*PFNGLTEXPARAMETERIPROC)(GLenum target, GLenum pname, GLint param);
     typedef GLenum (*PFNGLGETERRORPROC)(void);
     PFNGLACTIVETEXTUREPROC glActiveTextureFn = (PFNGLACTIVETEXTUREPROC)SDL_GL_GetProcAddress("glActiveTexture");
     PFNGLBINDTEXTUREPROC glBindTextureFn = (PFNGLBINDTEXTUREPROC)SDL_GL_GetProcAddress("glBindTexture");
-    PFNGLTEXPARAMETERIPROC glTexParameteriFn = (PFNGLTEXPARAMETERIPROC)SDL_GL_GetProcAddress("glTexParameteri");
     PFNGLGETERRORPROC glGetErrorFn = (PFNGLGETERRORPROC)SDL_GL_GetProcAddress("glGetError");
 
     if (!glActiveTextureFn || !glBindTextureFn) {
@@ -1118,18 +1116,6 @@ void EGLRenderer::renderFrame(AVFrame* frame)
             GLenum err = glGetErrorFn();
             if (err != GL_NO_ERROR) {
                 EGL_LOG(Error, "Failed to bind texture %d: 0x%x", (int)i, err);
-            }
-        }
-
-        // Use GL_NEAREST to reduce sampling if the video region is a multiple of the frame size
-        if (glTexParameteriFn) {
-            if (dst.w % frame->width == 0 && dst.h % frame->height == 0) {
-                glTexParameteriFn(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                glTexParameteriFn(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            }
-            else {
-                glTexParameteriFn(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                glTexParameteriFn(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             }
         }
     }

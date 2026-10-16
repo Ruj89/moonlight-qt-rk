@@ -1,8 +1,6 @@
 #include "pacer.h"
 #include "streaming/streamutils.h"
 
-#include <chrono>
-
 #ifdef Q_OS_WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -333,19 +331,13 @@ void Pacer::signalVsync()
 
 void Pacer::renderFrame(AVFrame* frame)
 {
-    // Helper function to get current time in microseconds
-    using namespace std::chrono;
-    auto getMicroseconds = []() {
-        return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
-    };
-    
     // Count time spent in Pacer's queues
-    uint64_t beforeRender = getMicroseconds();
+    uint64_t beforeRender = LiGetMicroseconds();
     m_VideoStats->totalPacerTimeUs += (beforeRender - (uint64_t)frame->pkt_dts);
 
     // Render it
     m_VsyncRenderer->renderFrame(frame);
-    uint64_t afterRender = getMicroseconds();
+    uint64_t afterRender = LiGetMicroseconds();
 
     m_VideoStats->totalRenderTimeUs += (afterRender - beforeRender);
     m_VideoStats->renderedFrames++;

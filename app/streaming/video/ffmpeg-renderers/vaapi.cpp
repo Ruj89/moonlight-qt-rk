@@ -26,8 +26,7 @@ VAAPIRenderer::VAAPIRenderer(int decoderSelectionPass)
       m_RequiresExplicitPixelFormat(false),
       m_OverlayMutex(nullptr)
 #ifdef HAVE_EGL
-    , m_EglExportType(EglExportType::Unknown),
-      m_EglImageFactory(this)
+    , m_EglExportType(EglExportType::Unknown)
 #endif
 {
 #ifdef HAVE_LIBVA_X11
@@ -348,14 +347,13 @@ VAAPIRenderer::initialize(PDECODER_PARAMETERS params)
             break;
         }
 
-#if defined(APP_IMAGE) || defined(USE_FALLBACK_DRIVER_PATHS)
-        // AppImages will be running with our libva.so which means they don't know about
+        // AppImages may be running with our libva.so which means they don't know about
         // distro-specific driver paths. To avoid failing in this scenario, we'll hardcode
         // some such paths here for common distros. Non-AppImage packaging mechanisms won't
         // need this fallback because either:
         // a) They are using both distro libva.so and distro libva drivers (native packages)
         // b) They are using both runtime libva.so and runtime libva drivers (Flatpak/Snap)
-        if (qEnvironmentVariableIsEmpty("LIBVA_DRIVERS_PATH")) {
+        if (qEnvironmentVariableIsEmpty("LIBVA_DRIVERS_PATH") && qgetenv("VAAPI_USE_FALLBACK_PATHS") == "1") {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Trying fallback VAAPI driver paths");
 
@@ -377,7 +375,6 @@ VAAPIRenderer::initialize(PDECODER_PARAMETERS params)
            setPathVar = true;
         }
         else
-#endif
         {
             if (setPathVar) {
                 // Unset LIBVA_DRIVERS_PATH if we set it ourselves
@@ -652,6 +649,12 @@ int VAAPIRenderer::getDecoderColorspace()
     // Gallium drivers don't support Rec 709 yet - https://gitlab.freedesktop.org/mesa/mesa/issues/1915
     // Intel-vaapi-driver defaults to Rec 601 - https://github.com/intel/intel-vaapi-driver/blob/021bcb79d1bd873bbd9fbca55f40320344bab866/src/i965_output_dri.c#L186
     return COLORSPACE_REC_601;
+}
+
+int VAAPIRenderer::getDecoderColorRange()
+{
+    // vaPutSurface() assumes limited range
+    return COLOR_RANGE_LIMITED;
 }
 
 int VAAPIRenderer::getDecoderCapabilities()
@@ -1082,11 +1085,12 @@ AVPixelFormat VAAPIRenderer::getEGLImagePixelFormat() {
 }
 
 bool
-VAAPIRenderer::initializeEGL(EGLDisplay dpy,
+VAAPIRenderer::initializeEGL(IFFmpegRenderer* eglRenderer,
+                             EGLDisplay dpy,
                              const EGLExtensions &ext) {
     VADRMPRIMESurfaceDescriptor descriptor;
 
-    if (!m_EglImageFactory.initializeEGL(dpy, ext)) {
+    if (!m_EglImageFactory.initializeEGL(eglRenderer, dpy, ext)) {
         return false;
     }
 

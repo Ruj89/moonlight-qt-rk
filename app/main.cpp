@@ -1,4 +1,5 @@
 #include <QGuiApplication>
+#include <QStyleHints>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QIcon>
@@ -33,6 +34,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <dxgi1_6.h>
 #elif defined(Q_OS_LINUX)
 #include <openssl/ssl.h>
 #endif
@@ -83,6 +85,10 @@ static QRegularExpression k_RikeyIdRegex("&rikeyid=[\\d-]+");
 static const uint64_t k_MaxLogSizeBytes = 10 * 1024 * 1024;
 static QAtomicInteger<uint64_t> s_LogBytesWritten = 0;
 static QFile* s_LoggerFile;
+#endif
+
+#ifdef HAVE_DRM_MASTER_HOOKS
+extern "C" bool g_DisableDrmHooks;
 #endif
 
 class LoggerTask : public QRunnable
@@ -338,6 +344,9 @@ int SDLCALL signalHandlerThread(void* data)
 {
     Q_UNUSED(data);
 
+    Session* lastSession = nullptr;
+    bool requestedQuit = false;
+
     int sig;
     while (recv(signalFds[1], &sig, sizeof(sig), MSG_WAITALL) == sizeof(sig)) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Received signal: %d", sig);
@@ -349,17 +358,32 @@ int SDLCALL signalHandlerThread(void* data)
             // Check if we have an active streaming session
             session = Session::get();
             if (session != nullptr) {
+                // Exit immediately if we haven't changed state since last attempt
+                if (session == lastSession || requestedQuit) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Exiting immediately on second signal");
+                    _Exit(1);
+                }
+
                 if (sig == SIGTERM) {
                     // If this is a SIGTERM, set the flag to quit
                     session->setShouldExit();
+                    requestedQuit = true;
                 }
 
                 // Stop the streaming session
                 session->interrupt();
+                lastSession = session;
             }
             else {
+                // Exit immediately if we haven't changed state since last attempt
+                if (requestedQuit) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Exiting immediately on second signal");
+                    _Exit(1);
+                }
+
                 // If we're not streaming, we'll close the whole app
                 QCoreApplication::instance()->quit();
+                requestedQuit = true;
             }
             break;
 
@@ -572,6 +596,18 @@ int main(int argc, char *argv[])
     SDL_SetHint(SDL_HINT_VIDEO_X11_FORCE_EGL, "1");
     qputenv("QT_XCB_GL_INTEGRATION", "xcb_egl");
 
+#ifdef Q_OS_WIN32
+    // Let us see the true VBlank rather than DWM's approximation. We do this here
+    // because this API must be called before the first swapchain (which Qt will
+    // create when the window is displayed). This is supported on Win11 22H2+.
+    auto fnDXGIDisableVBlankVirtualization =
+        (decltype(DXGIDisableVBlankVirtualization)*)GetProcAddress(GetModuleHandleW(L"dxgi.dll"),
+                                                                   "DXGIDisableVBlankVirtualization");
+    if (fnDXGIDisableVBlankVirtualization) {
+        fnDXGIDisableVBlankVirtualization();
+    }
+#endif
+
 #ifdef Q_OS_MACOS
     // This avoids using the default keychain for SSL, which may cause
     // password prompts on macOS.
@@ -599,8 +635,13 @@ int main(int argc, char *argv[])
     qputenv("QSG_RENDER_LOOP", "basic");
 #endif
 
-#if defined(Q_OS_DARWIN) && defined(QT_DEBUG)
-    // Enable Metal valiation for debug builds
+#if defined(Q_OS_DARWIN) && defined(QT_DEBUG) && !defined(HAVE_LIBPLACEBO_VULKAN)
+    // Enable Metal valiation for debug builds without libplacebo
+    //
+    // The current MoltenVK driver as of Vulkan SDK 1.4.350 triggers Metal debug layer
+    // violations on frame and overlay uploads like:
+    // _validateReplaceRegion:252: failed assertion `Replace Region Validation
+    // bytesPerRow(4803) must be a multiple of MTLPixelFormatBGRA8Unorm pixel bytes(4).
     qputenv("MTL_DEBUG_LAYER", "1");
     qputenv("MTL_SHADER_VALIDATION", "1");
 #endif
@@ -635,9 +676,13 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-#ifdef STEAM_LINK
+#if defined(STEAM_LINK) || defined(Q_OS_WIN32)
     // Steam Link requires that we initialize video before creating our
     // QGuiApplication in order to configure the framebuffer correctly.
+    //
+    // We keep the video subsystem initialized on Windows because it's
+    // much more costly to reinitialize than other platforms. It hurts
+    // the settings page transition performance significantly.
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "SDL_InitSubSystem(SDL_INIT_VIDEO) failed: %s",
@@ -673,10 +718,6 @@ int main(int argc, char *argv[])
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_APP_NAME, "Moonlight");
     SDL_SetHint(SDL_HINT_APP_NAME, "Moonlight");
 
-    // We handle capturing the mouse ourselves when it leaves the window, so we don't need
-    // SDL doing it for us behind our backs.
-    SDL_SetHint(SDL_HINT_MOUSE_AUTO_CAPTURE, "0");
-
     // SDL will try to lock the mouse cursor on Wayland if it's not visible in order to
     // support applications that assume they can warp the cursor (which isn't possible
     // on Wayland). We don't want this behavior because it interferes with seamless mouse
@@ -691,7 +732,38 @@ int main(int argc, char *argv[])
     SDL_SetHint(SDL_HINT_WINDOWS_DISABLE_THREAD_NAMING, "0");
 #endif
 
+    // Enable fast parameter checks on SDL 3.4.0+. We don't abuse the API by passing
+    // incorrect objects, so we don't need additional expensive parameter checks.
+    SDL_SetHint("SDL_INVALID_PARAM_CHECKS", "1");
+
+    // Disable hotplug detection for SDL_GetKeyboards() and SDL_GetMice(). We don't
+    // use this functionality and it can cause hangs when querying broken devices.
+    SDL_SetHint("SDL_WINDOWS_DETECT_DEVICE_HOTPLUG", "0");
+
+    // SDL3 supports offloading scaling to the Wayland compositor, which we take
+    // advantage of in the GL_IS_SLOW case to help fillrate-limited GPUs. To stay
+    // consistent with our own scaling logic, we need aspect ratio scaling which
+    // KDE doesn't currently handle properly. As a compromise, we'll just enable
+    // aspect ratio scaling in non-KDE environments.
+    //
+    // NB: We do not force SDL_VIDEO_WAYLAND_MODE_SCALING to "stretch" on KDE,
+    // because SDL 3.6 has a workaround for KDE and switches the default to
+    // "aspect" for all desktops.
+    if (!qgetenv("XDG_CURRENT_DESKTOP").contains("KDE")) {
+        SDL_SetHint("SDL_VIDEO_WAYLAND_MODE_SCALING", "aspect");
+    }
+
     QGuiApplication app(argc, argv);
+
+#ifdef Q_OS_DARWIN
+    // macOS defaults "Keyboard navigation" to text fields and lists only, which
+    // prevents Tab (and the gamepad navigation that synthesizes it) from moving
+    // focus between non-text controls on the settings page. Force Tab to reach
+    // all controls so keyboard and gamepad UI navigation work without requiring
+    // the user to enable a system accessibility setting. Other platforms already
+    // default to this behavior.
+    app.styleHints()->setTabFocusBehavior(Qt::TabFocusAllControls);
+#endif
 
 #ifdef Q_OS_UNIX
     // Register signal handlers to arbitrate between SDL and Qt.
@@ -754,6 +826,36 @@ int main(int argc, char *argv[])
                 "Running with SDL %d.%d.%d",
                 runtimeVersion.major, runtimeVersion.minor, runtimeVersion.patch);
 
+    // If we're running under sdl2-compat, it may tell us the underlying SDL3 version
+    const char* sdl3Version = SDL_GetHint("SDL3_VERSION");
+    int sdl3VersionInt = 0;
+    if (sdl3Version) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SDL3 version: %s",
+                    sdl3Version);
+
+        // Parse the version into integer form
+        QStringList list = QString(sdl3Version).split('.');
+        Q_ASSERT(list.size() == 3);
+        if (list.size() == 3) {
+            sdl3VersionInt = SDL_VERSIONNUM(list.at(0).toInt(), list.at(1).toInt(), list.at(2).toInt());
+        }
+    }
+
+    // SDL 3.4.0 and 3.4.2 have bugs in atomic KMSDRM support that break us,
+    // so disable atomic on the affected SDL3 versions. Since not all versions
+    // of sdl2-compat will set the SDL3_VERSION hint, we assume that versions
+    // prior to 2.32.66 are affected (since that was released at the same time
+    // as SDL 3.4.4 with the atomic fixes).
+    if ((sdl3VersionInt != 0 && sdl3VersionInt < SDL_VERSIONNUM(3, 4, 4)) ||
+            (runtimeVersion.patch >= 50 && runtimeVersion.patch < 66)) {
+#if !defined(Q_OS_WIN32) && !defined(Q_OS_DARWIN)
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Setting SDL_KMSDRM_ATOMIC=0 for older sdl2-compat/SDL3 version");
+        SDL_SetHint("SDL_KMSDRM_ATOMIC", "0");
+#endif
+    }
+
     // Apply the initial translation based on user preference
     StreamingPreferences::get()->retranslate();
 
@@ -783,6 +885,11 @@ int main(int argc, char *argv[])
     else if (QGuiApplication::platformName() == "eglfs" || QGuiApplication::platformName() == "linuxfb") {
         qputenv("SDL_VIDEODRIVER", "kmsdrm");
     }
+#endif
+
+#ifdef HAVE_DRM_MASTER_HOOKS
+    // Only use the Qt-SDL DRM master interoperability hooks if Qt is using KMS
+    g_DisableDrmHooks = QGuiApplication::platformName() != "eglfs";
 #endif
 
 #ifdef STEAM_LINK

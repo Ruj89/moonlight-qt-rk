@@ -204,7 +204,7 @@ public:
 
             // Trigger the main thread to recreate the decoder
             SDL_Event event;
-            event.type = SDL_RENDER_TARGETS_RESET;
+            event.type = SDL_RENDER_DEVICE_RESET;
             SDL_PushEvent(&event);
             return;
         }
@@ -455,6 +455,11 @@ public:
     {
         // macOS seems to handle Rec 601 best
         return COLORSPACE_REC_601;
+    }
+
+    int getDecoderColorRange() override
+    {
+        return COLOR_RANGE_LIMITED;
     }
 
     int getDecoderCapabilities() override

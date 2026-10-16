@@ -4,28 +4,11 @@
 #include "streaming/session.h"
 
 #include <h264_stream.h>
-#include <chrono>
 
 extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixdesc.h>
-}
-
-// Helper function to get current time in microseconds
-static inline uint64_t getMicroseconds() {
-    using namespace std::chrono;
-    return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
-}
-
-// Compatibility layer for DECODE_UNIT timing fields
-// The structure always uses enqueueTimeUs/receiveTimeUs (microseconds)
-static inline uint64_t getEnqueueTimeUs(const DECODE_UNIT& du) {
-    return du.enqueueTimeUs;
-}
-
-static inline uint64_t getReceiveTimeUs(const DECODE_UNIT& du) {
-    return du.receiveTimeUs;
 }
 
 #include "ffmpeg-renderers/sdlvid.h"
@@ -369,7 +352,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
 #ifdef GL_IS_SLOW
         glIsSlow = true;
 #else
-        glIsSlow = false;
+        glIsSlow = WMUtils::isGpuSlow();
 #endif
     }
 
@@ -377,7 +360,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
 #ifdef VULKAN_IS_SLOW
         vulkanIsSlow = true;
 #else
-        vulkanIsSlow = false;
+        vulkanIsSlow = WMUtils::isGpuSlow();
 #endif
     }
 
@@ -393,7 +376,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
             if (!vulkanIsSlow) {
                 // The Vulkan renderer can also handle HDR with a supported compositor. We prefer
                 // rendering HDR with Vulkan if possible since it's more fully featured than DRM.
-                m_FrontendRenderer = new PlVkRenderer(false, m_BackendRenderer);
+                m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
                 if (initializeRendererInternal(m_FrontendRenderer, params) && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_HDR_SUPPORT)) {
                     return true;
                 }
@@ -421,7 +404,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
             if (vulkanIsSlow) {
                 // Try Vulkan even if it's slow because we have no other renderer
                 // that can display HDR properly on Linux.
-                m_FrontendRenderer = new PlVkRenderer(false, m_BackendRenderer);
+                m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
                 if (initializeRendererInternal(m_FrontendRenderer, params) && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_HDR_SUPPORT)) {
                     return true;
                 }
@@ -434,7 +417,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
         {
 #ifdef HAVE_LIBPLACEBO_VULKAN
             if (qgetenv("PREFER_VULKAN") == "1") {
-                m_FrontendRenderer = new PlVkRenderer(false, m_BackendRenderer);
+                m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
                 if (initializeRendererInternal(m_FrontendRenderer, params)) {
                     return true;
                 }
@@ -589,23 +572,6 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
         return false;
     }
 
-    // The V4L2M2M decoders are one of the rare non-hwaccel decoders that allocates
-    // hardware frames under the hood. We need to adjust the number of buffers it
-    // allocates to ensure it allocates enough for our use case, but not too many.
-    // Normal hwaccel decoders will examine the codec/bitstream and the value we
-    // set in extra_hw_frames to determine how many buffers are required.
-    if (QString::fromUtf8(decoder->name).endsWith("_v4l2m2m", Qt::CaseInsensitive)) {
-        // 2 buffers for incoming compressed video data
-        av_dict_set_int(&options, "num_output_buffers", 2, 0);
-
-        // 4 ref frames + what pacer holds + a working surface for each output
-        //
-        // NB: The reason we allocate 4 ref frames and not 16 (H.264 maximum)
-        // is because V4L2M2M decoders have reference frame invalidation disabled
-        // for compatibility, so we will never actually need 16 reference frames.
-        av_dict_set_int(&options, "num_capture_buffers", 4 + PACER_MAX_OUTSTANDING_FRAMES + 2, 0);
-    }
-
     QString optionVarName = QString("%1_AVOPTIONS").arg(decoder->name).toUpper();
     QByteArray optionVarValue = qgetenv(optionVarName.toUtf8());
     if (!optionVarValue.isNull()) {
@@ -686,27 +652,6 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
             return false;
         }
 
-        // Most FFmpeg decoders process input using a "push" model.
-        // We'll see those fail here if the format is not supported.
-        err = avcodec_send_packet(m_VideoDecoderCtx, m_Pkt);
-        if (err < 0) {
-            char errorstring[512];
-            av_strerror(err, errorstring, sizeof(errorstring));
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Test decode failed (avcodec_send_packet): %s", errorstring);
-            return false;
-        }
-
-        // Signal EOS to force the decoder to immediately output the frame
-        err = avcodec_send_packet(m_VideoDecoderCtx, nullptr);
-        if (err < 0) {
-            char errorstring[512];
-            av_strerror(err, errorstring, sizeof(errorstring));
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Test flush failed (avcodec_send_packet): %s", errorstring);
-            return false;
-        }
-
         AVFrame* frame = av_frame_alloc();
         if (!frame) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -714,17 +659,39 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
             return false;
         }
 
-        err = avcodec_receive_frame(m_VideoDecoderCtx, frame);
-        if (err == 0) {
-            // Allow the renderer to do any validation it wants on this frame
-            if (!m_FrontendRenderer->testRenderFrame(frame)) {
-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "Test decode failed (testRenderFrame)");
+        // Some decoders won't output on the first frame, so we'll submit
+        // a few test frames if we get an EAGAIN error.
+        for (int retries = 0; retries < 5; retries++) {
+            // Most FFmpeg decoders process input using a "push" model.
+            // We'll see those fail here if the format is not supported.
+            err = avcodec_send_packet(m_VideoDecoderCtx, m_Pkt);
+            if (err < 0) {
                 av_frame_free(&frame);
+                char errorstring[512];
+                av_strerror(err, errorstring, sizeof(errorstring));
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Test decode failed (avcodec_send_packet): %s", errorstring);
                 return false;
             }
+
+            // A few FFmpeg decoders (h264_mmal) process here using a "pull" model.
+            // Those decoders will fail here if the format is not supported.
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(62, 28, 100)
+            err = avcodec_receive_frame_flags(m_VideoDecoderCtx, frame,
+                                              AV_CODEC_RECEIVE_FRAME_FLAG_SYNCHRONOUS);
+#else
+            err = avcodec_receive_frame(m_VideoDecoderCtx, frame);
+#endif
+            if (err == AVERROR(EAGAIN)) {
+                // Wait a little while to let the hardware work
+                SDL_Delay(100);
+            }
+            else {
+                // Done!
+                break;
+            }
         }
-        else if (err == AVERROR_BUG) {
+        if (err == AVERROR_BUG) {
             // RKMPP (Rockchip) decoder can output "invalid frame" on the synthetic test
             // frame; real stream often works. Retain the desktop workaround, but
             // require a real test frame on KMSDRM to validate DMA-BUF scanout/import.
@@ -749,6 +716,14 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
             av_strerror(err, errorstring, sizeof(errorstring));
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "Test decode failed (avcodec_receive_frame): %s", errorstring);
+            av_frame_free(&frame);
+            return false;
+        }
+
+        // Allow the renderer to do any validation it wants on this frame
+        if (err == 0 && !m_FrontendRenderer->testRenderFrame(frame)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Test decode failed (testRenderFrame)");
             av_frame_free(&frame);
             return false;
         }
@@ -847,7 +822,7 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     // The following code assumes the global measure was already started first
     SDL_assert(dst.measurementStartUs <= src.measurementStartUs);
 
-    double timeDiffSecs = (double)(getMicroseconds() - dst.measurementStartUs) / 1000000.0;
+    double timeDiffSecs = (double)(LiGetMicroseconds() - dst.measurementStartUs) / 1000000.0;
     dst.totalFps        = (double)dst.totalFrames / timeDiffSecs;
     dst.receivedFps     = (double)dst.receivedFrames / timeDiffSecs;
     dst.decodedFps      = (double)dst.decodedFrames / timeDiffSecs;
@@ -1040,8 +1015,10 @@ void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
     }
 }
 
-IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig* hwDecodeCfg, int pass)
+IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig* hwDecodeCfg, PDECODER_PARAMETERS params, int pass)
 {
+    Q_UNUSED(params);
+
     if (!(hwDecodeCfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
         return nullptr;
     }
@@ -1061,8 +1038,19 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
 #endif
 #ifdef Q_OS_DARWIN
         case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
-            // Prefer the Metal renderer if hardware is compatible
-            return VTMetalRendererFactory::createRenderer(true);
+            // Prefer the libplacebo (on MoltenVK) renderer unless explicitly opted out
+#ifdef HAVE_LIBPLACEBO_VULKAN
+            if (params->renderer == StreamingPreferences::RS_AUTO || params->renderer == StreamingPreferences::RS_VULKAN) {
+                return new PlVkRenderer(hwDecodeCfg->device_type);
+            }
+#endif
+            if (params->renderer == StreamingPreferences::RS_AVSBDL) {
+                return VTRendererFactory::createRenderer();
+            }
+            else {
+                // This covers both Metal explicitly selected and probe-only (since Metal is cheap to instantiate)
+                return VTMetalRendererFactory::createRenderer(true);
+            }
 #endif
 #ifdef HAVE_LIBVA
         case AV_HWDEVICE_TYPE_VAAPI:
@@ -1078,7 +1066,7 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
 #endif
 #ifdef HAVE_LIBPLACEBO_VULKAN
         case AV_HWDEVICE_TYPE_VULKAN:
-            return new PlVkRenderer(true);
+            return new PlVkRenderer(hwDecodeCfg->device_type);
 #endif
         default:
             // Handle pixel format-based renderer selection
@@ -1228,10 +1216,10 @@ bool FFmpegVideoDecoder::tryInitializeRenderer(const AVCodec* decoder,
         *failureReason = IFFmpegRenderer::InitFailureReason::Unknown;
     }
 
-    // i == 0 - Indirect via EGL or DRM frontend with zero-copy DMA-BUF passing
-    // i == 1 - Direct rendering or indirect via SDL read-back
+    // i == 0 - Indirect via EGL, DRM, or Vulkan frontend with zero-copy buffer passing
+    // i == 1 - Direct rendering or indirect via SDL or DRM read-back
     bool backendInitFailure = false;
-#ifdef HAVE_EGL
+#if defined(Q_OS_UNIX) && !defined(Q_OS_DARWIN) && (defined(HAVE_EGL) || defined(HAVE_DRM) || defined(HAVE_LIBPLACEBO_VULKAN))
     // On KMSDRM, scan out RKMPP's DMA-BUFs directly before trying EGL.
     // Desktop backends retain their existing EGL-first ordering.
     const bool preferDirectRendering = isRkmppOnKmsDrm(decoder);
@@ -1249,7 +1237,7 @@ bool FFmpegVideoDecoder::tryInitializeRenderer(const AVCodec* decoder,
 
         // Initialize the backend renderer for testing
         if (initializeRendererInternal(m_BackendRenderer, &testFrameDecoderParams)) {
-#ifdef HAVE_EGL
+#if defined(Q_OS_UNIX) && !defined(Q_OS_DARWIN) && (defined(HAVE_EGL) || defined(HAVE_DRM) || defined(HAVE_LIBPLACEBO_VULKAN))
             if (preferDirectRendering && i == 1 && !m_BackendRenderer->isDirectRenderingSupported()) {
                 // Do not let the direct-first attempt select SDL copyback ahead
                 // of the zero-copy EGL fallback when no KMS plane is available.
@@ -1364,7 +1352,7 @@ bool FFmpegVideoDecoder::tryInitializeRendererForUnknownDecoder(const AVCodec* d
 #ifdef GL_IS_SLOW
         glIsSlow = true;
 #else
-        glIsSlow = false;
+        glIsSlow = WMUtils::isGpuSlow();
 #endif
     }
 
@@ -1372,7 +1360,7 @@ bool FFmpegVideoDecoder::tryInitializeRendererForUnknownDecoder(const AVCodec* d
 #ifdef VULKAN_IS_SLOW
         vulkanIsSlow = true;
 #else
-        vulkanIsSlow = false;
+        vulkanIsSlow = WMUtils::isGpuSlow();
 #endif
     }
 
@@ -1402,7 +1390,7 @@ bool FFmpegVideoDecoder::tryInitializeRendererForUnknownDecoder(const AVCodec* d
                 // Initialize the hardware codec and submit a test frame if the renderer needs it
                 IFFmpegRenderer::InitFailureReason failureReason;
                 if (tryInitializeRenderer(decoder, AV_PIX_FMT_NONE, params, config, &failureReason,
-                                          [config, pass]() -> IFFmpegRenderer* { return createHwAccelRenderer(config, pass); })) {
+                                          [config, params, pass]() -> IFFmpegRenderer* { return createHwAccelRenderer(config, params, pass); })) {
                     return true;
                 }
                 else if (failureReason == IFFmpegRenderer::InitFailureReason::NoHardwareSupport) {
@@ -1612,7 +1600,7 @@ bool FFmpegVideoDecoder::tryInitializeHwAccelDecoder(PDECODER_PARAMETERS params,
             // Initialize the hardware codec and submit a test frame if the renderer needs it
             IFFmpegRenderer::InitFailureReason failureReason;
             if (tryInitializeRenderer(decoder, AV_PIX_FMT_NONE, params, config, &failureReason,
-                                      [config, pass]() -> IFFmpegRenderer* { return createHwAccelRenderer(config, pass); })) {
+                                      [config, params, pass]() -> IFFmpegRenderer* { return createHwAccelRenderer(config, params, pass); })) {
                 return true;
             }
             else if (failureReason == IFFmpegRenderer::InitFailureReason::NoHardwareSupport) {
@@ -1860,6 +1848,7 @@ void FFmpegVideoDecoder::writeBuffer(PLENTRY entry, int& offset)
     if (m_NeedsSpsFixup && entry->bufferType == BUFFER_TYPE_SPS) {
         h264_stream_t* stream = h264_new();
         int nalStart, nalEnd;
+        bool needsFixup;
 
         // Read the old NALU
         find_nal_unit((uint8_t*)entry->data, entry->length, &nalStart, &nalEnd);
@@ -1872,33 +1861,60 @@ void FFmpegVideoDecoder::writeBuffer(PLENTRY entry, int& offset)
 
         // Fixup the SPS to what OS X needs to use hardware acceleration
         // This is also critical for decoding latency on the Pi 2.
-        stream->sps->num_ref_frames = 1;
-        stream->sps->vui.max_dec_frame_buffering = 1;
+        needsFixup = (stream->sps->num_ref_frames != 1 || stream->sps->vui.max_dec_frame_buffering != 1);
+#ifndef QT_DEBUG
+        if (needsFixup)
+#endif
+        {
+            stream->sps->num_ref_frames = 1;
+            stream->sps->vui.max_dec_frame_buffering = 1;
 
-        // NVENC doesn't seem to add bitstream restrictions anymore (591.59),
-        // so we need to add them ourselves if not present to ensure that
-        // the max_dec_frame_buffering option actually takes effect.
-        // We use the defaults for everything except max_dec_frame_buffering.
-        if (!stream->sps->vui.bitstream_restriction_flag) {
-            stream->sps->vui.bitstream_restriction_flag = 1;
-            stream->sps->vui.motion_vectors_over_pic_boundaries_flag = 1;
-            stream->sps->vui.max_bytes_per_pic_denom = 2;
-            stream->sps->vui.max_bits_per_mb_denom = 1;
-            stream->sps->vui.log2_max_mv_length_horizontal = 16;
-            stream->sps->vui.log2_max_mv_length_vertical = 16;
-            stream->sps->vui.num_reorder_frames = 0;
+            // NVENC doesn't seem to add bitstream restrictions anymore (591.59),
+            // so we need to add them ourselves if not present to ensure that
+            // the max_dec_frame_buffering option actually takes effect.
+            // We use the defaults for everything except max_dec_frame_buffering.
+            if (!stream->sps->vui.bitstream_restriction_flag) {
+                stream->sps->vui.bitstream_restriction_flag = 1;
+                stream->sps->vui.motion_vectors_over_pic_boundaries_flag = 1;
+                stream->sps->vui.max_bytes_per_pic_denom = 2;
+                stream->sps->vui.max_bits_per_mb_denom = 1;
+                stream->sps->vui.log2_max_mv_length_horizontal = 16;
+                stream->sps->vui.log2_max_mv_length_vertical = 16;
+                stream->sps->vui.num_reorder_frames = 0;
+            }
+
+            int initialOffset = offset;
+
+            // Copy the modified NALU data. This clobbers byte 0 and starts NALU data at byte 1.
+            // Since it prepended one extra byte, subtract one from the returned length.
+            offset += write_nal_unit(stream, (uint8_t*)&m_DecodeBuffer.data()[initialOffset + nalStart - 1],
+                                     MAX_SPS_EXTRA_SIZE + entry->length - nalStart) - 1;
+
+            // Copy the NALU prefix over from the original SPS
+            memcpy(&m_DecodeBuffer.data()[initialOffset], entry->data, nalStart);
+            offset += nalStart;
+
+#ifdef QT_DEBUG
+            // If we didn't need a fixup, the SPS should have stayed the exact same
+            if (!needsFixup) {
+                SDL_assert(offset - initialOffset == entry->length);
+                SDL_assert(memcmp(&m_DecodeBuffer.data()[initialOffset], entry->data, entry->length) == 0);
+            }
+            else {
+                // The SPS should never get smaller with a fixup
+                SDL_assert(offset - initialOffset >= entry->length);
+            }
+#endif
         }
-
-        int initialOffset = offset;
-
-        // Copy the modified NALU data. This clobbers byte 0 and starts NALU data at byte 1.
-        // Since it prepended one extra byte, subtract one from the returned length.
-        offset += write_nal_unit(stream, (uint8_t*)&m_DecodeBuffer.data()[initialOffset + nalStart - 1],
-                                 MAX_SPS_EXTRA_SIZE + entry->length - nalStart) - 1;
-
-        // Copy the NALU prefix over from the original SPS
-        memcpy(&m_DecodeBuffer.data()[initialOffset], entry->data, nalStart);
-        offset += nalStart;
+#ifndef QT_DEBUG
+        else {
+            // Write the SPS as-is if it required no modification
+            memcpy(&m_DecodeBuffer.data()[offset],
+                   entry->data,
+                   entry->length);
+            offset += entry->length;
+        }
+#endif
 
         h264_free(stream);
     }
@@ -2015,6 +2031,74 @@ void FFmpegVideoDecoder::decoderThreadProc()
                         }
                     }
 
+                    // Some decoders don't propagate color metadata from the bitstream,
+                    // so we will try to guess it here if it was unset.
+                    if (frame->color_range == AVCOL_RANGE_UNSPECIFIED) {
+                        switch (getDecoderColorRange()) {
+                        case COLOR_RANGE_LIMITED:
+                            frame->color_range = AVCOL_RANGE_MPEG;
+                            break;
+                        case COLOR_RANGE_FULL:
+                            frame->color_range = AVCOL_RANGE_JPEG;
+                            break;
+                        }
+                    }
+                    if (frame->colorspace == AVCOL_SPC_UNSPECIFIED) {
+                        switch (getDecoderColorspace()) {
+                        case COLORSPACE_REC_601:
+                            frame->colorspace = AVCOL_SPC_SMPTE170M;
+                            break;
+                        case COLORSPACE_REC_709:
+                            frame->colorspace = AVCOL_SPC_BT709;
+                            break;
+                        case COLORSPACE_REC_2020:
+                            frame->colorspace = AVCOL_SPC_BT2020_NCL;
+                            break;
+                        }
+
+                        // HDR forces BT.2020 regardless of decoder preference
+                        if (LiGetCurrentHostDisplayHdrMode()) {
+                            frame->colorspace = AVCOL_SPC_BT2020_NCL;
+                        }
+                    }
+                    if (frame->color_primaries == AVCOL_PRI_UNSPECIFIED) {
+                        switch (frame->colorspace) {
+                        case AVCOL_SPC_BT709:
+                            frame->color_primaries = AVCOL_PRI_BT709;
+                            break;
+                        case AVCOL_SPC_SMPTE170M:
+                            frame->color_primaries = AVCOL_PRI_SMPTE170M;
+                            break;
+                        case AVCOL_SPC_BT2020_NCL:
+                        case AVCOL_SPC_BT2020_CL:
+                            frame->color_primaries = AVCOL_PRI_BT2020;
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+                    if (frame->color_trc == AVCOL_TRC_UNSPECIFIED) {
+                        switch (frame->colorspace) {
+                        case AVCOL_SPC_BT709:
+                            frame->color_trc = AVCOL_TRC_BT709;
+                            break;
+                        case AVCOL_SPC_SMPTE170M:
+                            frame->color_trc = AVCOL_TRC_SMPTE170M;
+                            break;
+                        case AVCOL_SPC_BT2020_NCL:
+                        case AVCOL_SPC_BT2020_CL:
+                            frame->color_trc = AVCOL_TRC_BT2020_10;
+                            break;
+                        default:
+                            break;
+                        }
+
+                        // HDR forces SMPTE 2084 PQ regardless of decoder preference
+                        if (LiGetCurrentHostDisplayHdrMode()) {
+                            frame->color_trc = AVCOL_TRC_SMPTE2084;
+                        }
+                    }
+
                     // Reset failed decodes count if we reached this far
                     m_ConsecutiveFailedDecodes = 0;
 
@@ -2022,32 +2106,17 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     av_log_set_level(AV_LOG_INFO);
 
                     // Capture a frame timestamp to measuring pacing delay
-                    frame->pkt_dts = getMicroseconds();
+                    frame->pkt_dts = LiGetMicroseconds();
 
                     if (!m_FrameInfoQueue.isEmpty()) {
                         // Data buffers in the DU are not valid here!
                         DECODE_UNIT du = m_FrameInfoQueue.dequeue();
 
-                        // Measure actual decode time from when we sent the packet to when we received the frame
-                        // We stored the decode start time in the timing field when we sent the packet
-                        uint64_t decodeEndTimeUs = getMicroseconds();
-                        uint64_t actualDecodeTimeUs = decodeEndTimeUs - getEnqueueTimeUs(du);
-                        
-                        // Cap decode time to a reasonable maximum (e.g., 100ms) to avoid reporting
-                        // incorrect values due to queue delays or timing issues
-                        const uint64_t MAX_REASONABLE_DECODE_TIME_US = 100000; // 100ms
-                        if (actualDecodeTimeUs > MAX_REASONABLE_DECODE_TIME_US) {
-                            // If decode time is unreasonably high, it's likely due to queue delays
-                            // Use a more conservative estimate based on frame rate
-                            actualDecodeTimeUs = MAX_REASONABLE_DECODE_TIME_US;
-                        }
-                        
-                        m_ActiveWndVideoStats.totalDecodeTimeUs += actualDecodeTimeUs;
+                        // Count decoder processing and queue time as decoding latency.
+                        m_ActiveWndVideoStats.totalDecodeTimeUs += (LiGetMicroseconds() - du.enqueueTimeUs);
 
-                        // Store the presentation time (90 kHz timebase)
-                        // rtpTimestamp field was removed, use frame number as fallback
-                        // The actual PTS will be set by the decoder based on frame timing
-                        frame->pts = AV_NOPTS_VALUE;
+                        // Store the presentation time (90 kHz timebase).
+                        frame->pts = (int64_t)du.rtpTimestamp;
                     }
 
                     m_ActiveWndVideoStats.decodedFrames++;
@@ -2120,7 +2189,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     }
 
     if (!m_LastFrameNumber) {
-        m_ActiveWndVideoStats.measurementStartUs = getMicroseconds();
+        m_ActiveWndVideoStats.measurementStartUs = LiGetMicroseconds();
         m_LastFrameNumber = du->frameNumber;
     }
     else {
@@ -2133,7 +2202,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     m_BwTracker.AddBytes(du->fullLength);
 
     // Flip stats windows roughly every second
-    if (getMicroseconds() > m_ActiveWndVideoStats.measurementStartUs + 1000000) {
+    if (LiGetMicroseconds() > m_ActiveWndVideoStats.measurementStartUs + 1000000) {
         // Update overlay stats if it's enabled
         if (Session::get()->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug)) {
             VIDEO_STATS lastTwoWndStats = {};
@@ -2152,7 +2221,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
         // Move this window into the last window slot and clear it for next window
         SDL_memcpy(&m_LastWndVideoStats, &m_ActiveWndVideoStats, sizeof(m_ActiveWndVideoStats));
         SDL_zero(m_ActiveWndVideoStats);
-        m_ActiveWndVideoStats.measurementStartUs = getMicroseconds();
+        m_ActiveWndVideoStats.measurementStartUs = LiGetMicroseconds();
     }
 
     if (du->frameHostProcessingLatency != 0) {
@@ -2195,12 +2264,8 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
         m_Pkt->flags = 0;
     }
 
-    // Calculate reassembly time (enqueue time - receive time) in microseconds
-    m_ActiveWndVideoStats.totalReassemblyTimeUs += (getEnqueueTimeUs(*du) - getReceiveTimeUs(*du));
+    m_ActiveWndVideoStats.totalReassemblyTimeUs += (du->enqueueTimeUs - du->receiveTimeUs);
 
-    // Track when we actually send the packet to the decoder (when decoding starts)
-    uint64_t decodeStartTimeUs = getMicroseconds();
-    
     err = avcodec_send_packet(m_VideoDecoderCtx, m_Pkt);
     if (err < 0) {
         char errorstring[512];
@@ -2228,11 +2293,7 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
         return DR_NEED_IDR;
     }
 
-    // Store the decode start time in the frame's timing field temporarily
-    // We'll use this to calculate actual decode time, not queue wait time
-    DECODE_UNIT duWithDecodeTime = *du;
-    duWithDecodeTime.enqueueTimeUs = decodeStartTimeUs;
-    m_FrameInfoQueue.enqueue(duWithDecodeTime);
+    m_FrameInfoQueue.enqueue(*du);
 
     m_FramesIn++;
     return DR_OK;

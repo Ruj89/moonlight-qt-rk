@@ -82,7 +82,9 @@ bool SdlRenderer::isRenderThreadSupported()
                 "SDL renderer backend: %s",
                 info.name);
 
-    if (info.name != QString("direct3d") && info.name != QString("metal")) {
+    if (info.name != QString("direct3d11") &&
+        info.name != QString("direct3d12") &&
+        info.name != QString("metal")) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "SDL renderer backend requires main thread rendering");
         return false;
@@ -217,15 +219,6 @@ bool SdlRenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
-#ifdef Q_OS_WIN32
-    // For some reason, using Direct3D9Ex breaks this with multi-monitor setups.
-    // When focus is lost, the window is minimized then immediately restored without
-    // input focus. This glitches out the renderer and a bunch of other stuff.
-    // Direct3D9Ex itself seems to have this minimize on focus loss behavior on its
-    // own, so just disable SDL's handling of the focus loss event.
-    SDL_SetHintWithPriority(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0", SDL_HINT_OVERRIDE);
-#endif
-
     return true;
 }
 
@@ -359,9 +352,11 @@ ReadbackRetry:
             av_dict_set_int(&options, "srcw", frame->width, 0);
             av_dict_set_int(&options, "srch", frame->height, 0);
             av_dict_set_int(&options, "src_format", frame->format, 0);
+            av_dict_set_int(&options, "src_range", isFrameFullRange(frame) ? 1 : 0, 0);
             av_dict_set_int(&options, "dstw", m_RgbFrame->width, 0);
             av_dict_set_int(&options, "dsth", m_RgbFrame->height, 0);
             av_dict_set_int(&options, "dst_format", m_RgbFrame->format, 0);
+            av_dict_set_int(&options, "dst_range", 1, 0);
             av_dict_set_int(&options, "threads", std::min(SDL_GetCPUCount(), 4), 0); // Up to 4 threads
 
             err = av_opt_set_dict(m_SwsContext, &options);
@@ -583,11 +578,6 @@ ReadbackRetry:
     // Ensure the viewport is set to the desired video region
     SDL_RenderSetViewport(m_Renderer, &dst);
 
-    // Use nearest pixel sampling if the video region size is a multiple of the frame size
-    SDL_SetTextureScaleMode(m_Texture,
-                            dst.w % frame->width == 0 && dst.h % frame->height == 0 ?
-                                SDL_ScaleModeNearest : SDL_ScaleModeLinear);
-
     // Draw the video content itself
     SDL_RenderCopy(m_Renderer, m_Texture, nullptr, nullptr);
 
@@ -647,11 +637,24 @@ bool SdlRenderer::testRenderFrame(AVFrame* frame)
 
 bool SdlRenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
 {
-    // We can transparently handle size and display changes, except Windows where
-    // changing size appears to break the renderer (maybe due to the render thread?)
-#ifdef Q_OS_WIN32
-    return !(info->stateChangeFlags & ~(WINDOW_STATE_CHANGE_DISPLAY));
-#else
+    // We can transparently handle size and display changes
     return !(info->stateChangeFlags & ~(WINDOW_STATE_CHANGE_SIZE | WINDOW_STATE_CHANGE_DISPLAY));
+}
+
+int SdlRenderer::getDecoderColorspace()
+{
+    // SDL2 only supports both full and limited range for BT.601. Additionally, libswscale
+    // assumes content is in the BT.601 color space when performing YUV to RGB conversion.
+    return COLORSPACE_REC_601;
+}
+
+int SdlRenderer::getDecoderColorRange()
+{
+    // Prefer full range only on FFmpeg 5.0 or later, since we don't implement
+    // color range handling in the legacy FFmpeg 4.x codepath.
+#if LIBSWSCALE_VERSION_INT >= AV_VERSION_INT(6, 1, 100)
+    return COLOR_RANGE_FULL;
+#else
+    return COLOR_RANGE_LIMITED;
 #endif
 }
